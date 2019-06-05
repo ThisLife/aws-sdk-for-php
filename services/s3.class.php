@@ -492,6 +492,20 @@ class AmazonS3 extends CFRuntime
 		parent::__construct($options);
 	}
 
+    private function sign($key, $msg)
+    {
+        return hash_hmac('sha256', $msg, $key);
+    }
+
+    private function getSignatureKey( $key, $dateStamp, $regionName, $serviceName)
+    {
+        $kDate = $this->sign('AWS4' . $key, $dateStamp);
+        $kRegion = $this->sign(hex2bin($kDate), $regionName);
+        $kService = $this->sign(hex2bin($kRegion), $serviceName);
+        $kSigning = $this->sign(hex2bin($kService), 'aws4_request');
+        return $kSigning;
+    }
+
 
 	/*%******************************************************************************************%*/
 	// AUTHENTICATION
@@ -537,465 +551,544 @@ class AmazonS3 extends CFRuntime
 		 * 	Tells authenticate() to return the cURL handle for the request instead of executing it.
 		 */
 
-		// Rename variables (to overcome inheritence issues)
-		$bucket = $operation;
-		$opt = $payload;
-
-		// Validate the S3 bucket name
-		if (!$this->validate_bucketname_support($bucket))
-		{
-			// @codeCoverageIgnoreStart
-			throw new S3_Exception('S3 does not support "' . $bucket . '" as a valid bucket name. Review "Bucket Restrictions and Limitations" in the S3 Developer Guide for more information.');
-			// @codeCoverageIgnoreEnd
-		}
-
-		// Die if $opt isn't set.
-		if (!$opt) return false;
-
-		$method_arguments = func_get_args();
-
-		// Use the caching flow to determine if we need to do a round-trip to the server.
-		if ($this->use_cache_flow)
-		{
-			// Generate an identifier specific to this particular set of arguments.
-			$cache_id = $this->key . '_' . get_class($this) . '_' . $bucket . '_' . sha1(serialize($method_arguments));
-
-			// Instantiate the appropriate caching object.
-			$this->cache_object = new $this->cache_class($cache_id, $this->cache_location, $this->cache_expires, $this->cache_compress);
-
-			if ($this->delete_cache)
-			{
-				$this->use_cache_flow = false;
-				$this->delete_cache = false;
-				return $this->cache_object->delete();
-			}
-
-			// Invoke the cache callback function to determine whether to pull data from the cache or make a fresh request.
-			$data = $this->cache_object->response_manager(array($this, 'cache_callback'), $method_arguments);
-
-			if ($this->parse_the_response)
-			{
-				// Parse the XML body
-				$data = $this->parse_callback($data);
-			}
-
-			// End!
-			return $data;
-		}
-
-		// If we haven't already set a resource prefix and the bucket name isn't DNS-valid...
-		if ((!$this->resource_prefix && !$this->validate_bucketname_create($bucket)) || $this->path_style)
-		{
-			// Fall back to the older path-style URI
-			$this->set_resource_prefix('/' . $bucket);
-			$this->temporary_prefix = true;
-		}
-
-		// If the bucket name has periods and we are using SSL, we need to switch to path style URLs
-		$bucket_name_may_cause_ssl_wildcard_failures = false;
-		if ($this->use_ssl && strpos($bucket, '.') !== false)
-		{
-			$bucket_name_may_cause_ssl_wildcard_failures = true;
-		}
-
-		// Determine hostname
-		$scheme = $this->use_ssl ? 'https://' : 'http://';
-		if ($bucket_name_may_cause_ssl_wildcard_failures || $this->resource_prefix || $this->path_style)
-		{
-			// Use bucket-in-path method
-			$hostname = $this->hostname . $this->resource_prefix . (($bucket === '' || $this->resource_prefix === '/' . $bucket) ? '' : ('/' . $bucket));
-		}
-		else
-		{
-			$hostname = $this->vhost ? $this->vhost : (($bucket === '') ? $this->hostname : ($bucket . '.') . $this->hostname);
-		}
-
-		// Get the UTC timestamp in RFC 2616 format
-		$date = gmdate(CFUtilities::DATE_FORMAT_RFC2616, time());
-
-		// Storage for request parameters.
-		$resource = '';
-		$sub_resource = '';
-		$querystringparams = array();
-		$signable_querystringparams = array();
-		$string_to_sign = '';
-		$headers = array(
-			'Content-MD5' => '',
-			'Content-Type' => 'application/x-www-form-urlencoded',
-			'Date' => $date
-		);
-
-		/*%******************************************************************************************%*/
-
-		// Do we have an authentication token?
-		if ($this->auth_token)
-		{
-			$headers['X-Amz-Security-Token'] = $this->auth_token;
-		}
-
-		// Handle specific resources
-		if (isset($opt['resource']))
-		{
-			$resource .= $opt['resource'];
-		}
-
-		// Merge query string values
-		if (isset($opt['query_string']))
-		{
-			$querystringparams = array_merge($querystringparams, $opt['query_string']);
-		}
-		$query_string = $this->util->to_query_string($querystringparams);
-
-		// Merge the signable query string values. Must be alphabetical.
-		$signable_list = array(
-			'partNumber',
-			'response-cache-control',
-			'response-content-disposition',
-			'response-content-encoding',
-			'response-content-language',
-			'response-content-type',
-			'response-expires',
-			'uploadId',
-			'versionId'
-		);
-		foreach ($signable_list as $item)
-		{
-			if (isset($opt[$item]))
-			{
-				$signable_querystringparams[$item] = $opt[$item];
-			}
-		}
-		$signable_query_string = $this->util->to_query_string($signable_querystringparams);
-
-		// Merge the HTTP headers
-		if (isset($opt['headers']))
-		{
-			$headers = array_merge($headers, $opt['headers']);
-		}
-
-		// Compile the URI to request
-		$conjunction = '?';
-		$signable_resource = '/' . str_replace('%2F', '/', rawurlencode($resource));
-		$non_signable_resource = '';
-
-		if (isset($opt['sub_resource']))
-		{
-			$signable_resource .= $conjunction . rawurlencode($opt['sub_resource']);
-			$conjunction = '&';
-		}
-		if ($signable_query_string !== '')
-		{
-			$signable_query_string = $conjunction . $signable_query_string;
-			$conjunction = '&';
-		}
-		if ($query_string !== '')
-		{
-			$non_signable_resource .= $conjunction . $query_string;
-			$conjunction = '&';
-		}
-		if (substr($hostname, -1) === substr($signable_resource, 0, 1))
-		{
-			$signable_resource = ltrim($signable_resource, '/');
-		}
-
-		$this->request_url = $scheme . $hostname . $signable_resource . $signable_query_string . $non_signable_resource;
-
-		if (isset($opt['location']))
-		{
-			$this->request_url = $opt['location'];
-		}
-
-		// Gather information to pass along to other classes.
-		$helpers = array(
-			'utilities' => $this->utilities_class,
-			'request' => $this->request_class,
-			'response' => $this->response_class,
-		);
-
-		// Instantiate the request class
-		$request = new $this->request_class($this->request_url, $this->proxy, $helpers, $this->credentials);
-
-		// Update RequestCore settings
-		$request->request_class = $this->request_class;
-		$request->response_class = $this->response_class;
-		$request->ssl_verification = $this->ssl_verification;
-
-		// Pass along registered stream callbacks
-		if ($this->registered_streaming_read_callback)
-		{
-			$request->register_streaming_read_callback($this->registered_streaming_read_callback);
-		}
-
-		if ($this->registered_streaming_write_callback)
-		{
-			$request->register_streaming_write_callback($this->registered_streaming_write_callback);
-		}
-
-		// Streaming uploads
-		if (isset($opt['fileUpload']))
-		{
-			if (is_resource($opt['fileUpload']))
-			{
-				// Determine the length to read from the stream
-				$length = null; // From current position until EOF by default, size determined by set_read_stream()
-
-				if (isset($headers['Content-Length']))
-				{
-					$length = $headers['Content-Length'];
-				}
-				elseif (isset($opt['seekTo']))
-				{
-					// Read from seekTo until EOF by default
-					$stats = fstat($opt['fileUpload']);
-
-					if ($stats && $stats['size'] >= 0)
-					{
-						$length = $stats['size'] - (integer) $opt['seekTo'];
-					}
-				}
-
-				$request->set_read_stream($opt['fileUpload'], $length);
-
-				if ($headers['Content-Type'] === 'application/x-www-form-urlencoded')
-				{
-					$headers['Content-Type'] = 'application/octet-stream';
-				}
-			}
-			else
-			{
-				$request->set_read_file($opt['fileUpload']);
-
-				// Determine the length to read from the file
-				$length = $request->read_stream_size; // The file size by default
-
-				if (isset($headers['Content-Length']))
-				{
-					$length = $headers['Content-Length'];
-				}
-				elseif (isset($opt['seekTo']) && isset($length))
-				{
-					// Read from seekTo until EOF by default
-					$length -= (integer) $opt['seekTo'];
-				}
-
-				$request->set_read_stream_size($length);
-
-				// Attempt to guess the correct mime-type
-				if ($headers['Content-Type'] === 'application/x-www-form-urlencoded')
-				{
-					$extension = explode('.', $opt['fileUpload']);
-					$extension = array_pop($extension);
-					$mime_type = CFMimeTypes::get_mimetype($extension);
-					$headers['Content-Type'] = $mime_type;
-				}
-			}
-
-			$headers['Content-Length'] = $request->read_stream_size;
-			$headers['Content-MD5'] = '';
-		}
-
-		// Handle streaming file offsets
-		if (isset($opt['seekTo']))
-		{
-			// Pass the seek position to RequestCore
-			$request->set_seek_position((integer) $opt['seekTo']);
-		}
-
-		// Streaming downloads
-		if (isset($opt['fileDownload']))
-		{
-			if (is_resource($opt['fileDownload']))
-			{
-				$request->set_write_stream($opt['fileDownload']);
-			}
-			else
-			{
-				$request->set_write_file($opt['fileDownload']);
-			}
-		}
-
-		$curlopts = array();
-
-		// Set custom CURLOPT settings
-		if (isset($opt['curlopts']))
-		{
-			$curlopts = $opt['curlopts'];
-		}
-
-		// Debug mode
-		if ($this->debug_mode)
-		{
-			$curlopts[CURLOPT_VERBOSE] = true;
-		}
-
-		// Set the curl options.
-		if (count($curlopts))
-		{
-			$request->set_curlopts($curlopts);
-		}
-
-		// Do we have a verb?
-		if (isset($opt['verb']))
-		{
-			$request->set_method($opt['verb']);
-			$string_to_sign .= $opt['verb'] . "\n";
-		}
-
-		// Add headers and content when we have a body
-		if (isset($opt['body']))
-		{
-			$request->set_body($opt['body']);
-			$headers['Content-Length'] = strlen($opt['body']);
-
-			if ($headers['Content-Type'] === 'application/x-www-form-urlencoded')
-			{
-				$headers['Content-Type'] = 'application/octet-stream';
-			}
-
-			if (!isset($opt['NoContentMD5']) || $opt['NoContentMD5'] !== true)
-			{
-				$headers['Content-MD5'] = $this->util->hex_to_base64(md5($opt['body']));
-			}
-		}
-
-		// Handle query-string authentication
-		if (isset($opt['preauth']) && (integer) $opt['preauth'] > 0)
-		{
-			unset($headers['Date']);
-			$headers['Content-Type'] = '';
-			$headers['Expires'] = is_int($opt['preauth']) ? $opt['preauth'] : strtotime($opt['preauth']);
-		}
-
-		// Sort headers
-		uksort($headers, 'strnatcasecmp');
-
-		// Add headers to request and compute the string to sign
-		foreach ($headers as $header_key => $header_value)
-		{
-			// Strip linebreaks from header values as they're illegal and can allow for security issues
-			$header_value = str_replace(array("\r", "\n"), '', $header_value);
-
-			// Add the header if it has a value
-			if ($header_value !== '')
-			{
-				$request->add_header($header_key, $header_value);
-			}
-
-			// Generate the string to sign
-			if (
-				strtolower($header_key) === 'content-md5' ||
-				strtolower($header_key) === 'content-type' ||
-				strtolower($header_key) === 'date' ||
-				(strtolower($header_key) === 'expires' && isset($opt['preauth']) && (integer) $opt['preauth'] > 0)
-			)
-			{
-				$string_to_sign .= $header_value . "\n";
-			}
-			elseif (substr(strtolower($header_key), 0, 6) === 'x-amz-')
-			{
-				$string_to_sign .= strtolower($header_key) . ':' . $header_value . "\n";
-			}
-		}
-
-		// Add the signable resource location
-		$string_to_sign .= ($this->resource_prefix ? $this->resource_prefix : '');
-		$string_to_sign .= (($bucket === '' || $this->resource_prefix === '/' . $bucket) ? '' : ('/' . $bucket)) . $signable_resource . urldecode($signable_query_string);
-
-		// Hash the AWS secret key and generate a signature for the request.
-		$signature = base64_encode(hash_hmac('sha1', $string_to_sign, $this->secret_key, true));
-		$request->add_header('Authorization', 'AWS ' . $this->key . ':' . $signature);
-
-		// If we're generating a URL, return the URL to the calling method.
-		if (isset($opt['preauth']) && (integer) $opt['preauth'] > 0)
-		{
-			$query_params = array(
-				'AWSAccessKeyId' => $this->key,
-				'Expires' => $headers['Expires'],
-				'Signature' => $signature,
-			);
-
-			// If using short-term credentials, add the token to the query string
-			if ($this->auth_token)
-			{
-				$query_params['x-amz-security-token'] = $this->auth_token;
-			}
-
-			return $this->request_url . $conjunction . http_build_query($query_params, '', '&');
-		}
-		elseif (isset($opt['preauth']))
-		{
-			return $this->request_url;
-		}
-
-		/*%******************************************************************************************%*/
-
-		// If our changes were temporary, reset them.
-		if ($this->temporary_prefix)
-		{
-			$this->temporary_prefix = false;
-			$this->resource_prefix = null;
-		}
-
-		// Manage the (newer) batch request API or the (older) returnCurlHandle setting.
-		if ($this->use_batch_flow)
-		{
-			$handle = $request->prep_request();
-			$this->batch_object->add($handle);
-			$this->use_batch_flow = false;
-
-			return $handle;
-		}
-		elseif (isset($opt['returnCurlHandle']) && $opt['returnCurlHandle'] === true)
-		{
-			return $request->prep_request();
-		}
-
-		// Send!
-		$request->send_request();
-
-		// Prepare the response
-		$headers = $request->get_response_header();
-		$headers['x-aws-request-url'] = $this->request_url;
-		$headers['x-aws-redirects'] = $this->redirects;
-		$headers['x-aws-stringtosign'] = $string_to_sign;
-		$headers['x-aws-requestheaders'] = $request->request_headers;
-
-		// Did we have a request body?
-		if (isset($opt['body']))
-		{
-			$headers['x-aws-requestbody'] = $opt['body'];
-		}
-
-		$data = new $this->response_class($headers, $this->parse_callback($request->get_response_body()), $request->get_response_code());
-
-		// Did Amazon tell us to redirect? Typically happens for multiple rapid requests EU datacenters.
-		// @see: http://docs.amazonwebservices.com/AmazonS3/latest/dev/Redirects.html
-		// @codeCoverageIgnoreStart
-		if ((integer) $request->get_response_code() === 307) // Temporary redirect to new endpoint.
-		{
-			$this->redirects++;
-			$opt['location'] = $headers['location'];
-			$data = $this->authenticate($bucket, $opt);
-		}
-
-		// Was it Amazon's fault the request failed? Retry the request until we reach $max_retries.
-		elseif ((integer) $request->get_response_code() === 500 || (integer) $request->get_response_code() === 503)
-		{
-			if ($this->redirects <= $this->max_retries)
-			{
-				// Exponential backoff
-				$delay = (integer) (pow(4, $this->redirects) * 100000);
-				usleep($delay);
-				$this->redirects++;
-				$data = $this->authenticate($bucket, $opt);
-			}
-		}
-		// @codeCoverageIgnoreEnd
-
-		// Return!
-		$this->redirects = 0;
-		return $data;
-	}
+        // Rename variables (to overcome inheritence issues)
+        $bucket = $operation;
+        $opt = $payload;
+
+        // Validate the S3 bucket name
+        if (!$this->validate_bucketname_support($bucket))
+        {
+            // @codeCoverageIgnoreStart
+            throw new S3_Exception('S3 does not support "' . $bucket . '" as a valid bucket name. Review "Bucket Restrictions and Limitations" in the S3 Developer Guide for more information.');
+            // @codeCoverageIgnoreEnd
+        }
+
+        // Die if $opt isn't set.
+        if (!$opt) return false;
+
+        $method_arguments = func_get_args();
+
+        // Use the caching flow to determine if we need to do a round-trip to the server.
+        if ($this->use_cache_flow)
+        {
+            // Generate an identifier specific to this particular set of arguments.
+            $cache_id = $this->key . '_' . get_class($this) . '_' . $bucket . '_' . sha1(serialize($method_arguments));
+
+            // Instantiate the appropriate caching object.
+            $this->cache_object = new $this->cache_class($cache_id, $this->cache_location, $this->cache_expires, $this->cache_compress);
+
+            if ($this->delete_cache)
+            {
+                $this->use_cache_flow = false;
+                $this->delete_cache = false;
+                return $this->cache_object->delete();
+            }
+
+            // Invoke the cache callback function to determine whether to pull data from the cache or make a fresh request.
+            $data = $this->cache_object->response_manager(array($this, 'cache_callback'), $method_arguments);
+
+            if ($this->parse_the_response)
+            {
+                // Parse the XML body
+                $data = $this->parse_callback($data);
+            }
+
+            // End!
+            return $data;
+        }
+
+        // If we haven't already set a resource prefix and the bucket name isn't DNS-valid...
+        if ((!$this->resource_prefix && !$this->validate_bucketname_create($bucket)) || $this->path_style)
+        {
+            // Fall back to the older path-style URI
+            $this->set_resource_prefix('/' . $bucket);
+            $this->temporary_prefix = true;
+        }
+
+        // Determine hostname
+        $scheme = $this->use_ssl ? 'https://' : 'http://';
+        if ($this->resource_prefix || $this->path_style) // Use bucket-in-path method.
+        {
+            $hostname = $this->hostname . $this->resource_prefix . (($bucket === '' || $this->resource_prefix === '/' . $bucket) ? '' : ('/' . $bucket));
+        }
+        else
+        {
+            $hostname = $this->vhost ? $this->vhost : (($bucket === '') ? $this->hostname : ($bucket . '.') . $this->hostname);
+        }
+
+        // Get the UTC timestamp in RFC 2616 format
+        $date = gmdate(CFUtilities::DATE_FORMAT_RFC2616, time());
+
+        // Storage for request parameters.
+        $resource = '';
+        $sub_resource = '';
+        $querystringparams = array();
+        $signable_querystringparams = array();
+        $string_to_sign = '';
+        $headers = array(
+            'Content-MD5' => '',
+            'Content-Type' => 'application/x-www-form-urlencoded',
+            'Date' => $date
+        );
+
+        /*%******************************************************************************************%*/
+
+        // Do we have an authentication token?
+        if ($this->auth_token)
+        {
+            $headers['X-Amz-Security-Token'] = $this->auth_token;
+        }
+
+        // Handle specific resources
+        if (isset($opt['resource']))
+        {
+            $resource .= $opt['resource'];
+        }
+
+        // Merge query string values
+        if (isset($opt['query_string']))
+        {
+            $querystringparams = array_merge($querystringparams, $opt['query_string']);
+        }
+        $query_string = $this->util->to_query_string($querystringparams);
+
+        // Merge the signable query string values. Must be alphabetical.
+        $signable_list = array(
+            'partNumber',
+            'response-cache-control',
+            'response-content-disposition',
+            'response-content-encoding',
+            'response-content-language',
+            'response-content-type',
+            'response-expires',
+            'uploadId',
+            'versionId'
+        );
+        foreach ($signable_list as $item)
+        {
+            if (isset($opt[$item]))
+            {
+                $signable_querystringparams[$item] = $opt[$item];
+            }
+        }
+        $signable_query_string = $this->util->to_query_string($signable_querystringparams);
+
+        // Merge the HTTP headers
+        if (isset($opt['headers']))
+        {
+            $headers = array_merge($headers, $opt['headers']);
+        }
+
+        // Compile the URI to request
+        $conjunction = '?';
+        $signable_resource = '/' . str_replace('%2F', '/', rawurlencode($resource));
+        $non_signable_resource = '';
+
+        if (isset($opt['sub_resource']))
+        {
+            $signable_resource .= $conjunction . rawurlencode($opt['sub_resource']);
+            $conjunction = '&';
+        }
+        if ($signable_query_string !== '')
+        {
+            $signable_query_string = $conjunction . $signable_query_string;
+            $conjunction = '&';
+        }
+        if ($query_string !== '')
+        {
+            $non_signable_resource .= $conjunction . $query_string;
+            $conjunction = '&';
+        }
+        if (substr($hostname, -1) === substr($signable_resource, 0, 1))
+        {
+            $signable_resource = ltrim($signable_resource, '/');
+        }
+
+        $this->request_url = $scheme . $hostname . $signable_resource . $signable_query_string . $non_signable_resource;
+
+        if (isset($opt['location']))
+        {
+            $this->request_url = $opt['location'];
+        }
+
+        // Gather information to pass along to other classes.
+        $helpers = array(
+            'utilities' => $this->utilities_class,
+            'request' => $this->request_class,
+            'response' => $this->response_class,
+        );
+
+        // Instantiate the request class
+        $request = new $this->request_class($this->request_url, $this->proxy, $helpers, $this->credentials);
+
+        // Update RequestCore settings
+        $request->request_class = $this->request_class;
+        $request->response_class = $this->response_class;
+        $request->ssl_verification = $this->ssl_verification;
+
+        // Pass along registered stream callbacks
+        if ($this->registered_streaming_read_callback)
+        {
+            $request->register_streaming_read_callback($this->registered_streaming_read_callback);
+        }
+
+        if ($this->registered_streaming_write_callback)
+        {
+            $request->register_streaming_write_callback($this->registered_streaming_write_callback);
+        }
+
+        // Streaming uploads
+        if (isset($opt['fileUpload']))
+        {
+            if (is_resource($opt['fileUpload']))
+            {
+                // Determine the length to read from the stream
+                $length = null; // From current position until EOF by default, size determined by set_read_stream()
+
+                if (isset($headers['Content-Length']))
+                {
+                    $length = $headers['Content-Length'];
+                }
+                elseif (isset($opt['seekTo']))
+                {
+                    // Read from seekTo until EOF by default
+                    $stats = fstat($opt['fileUpload']);
+
+                    if ($stats && $stats['size'] >= 0)
+                    {
+                        $length = $stats['size'] - (integer) $opt['seekTo'];
+                    }
+                }
+
+                $request->set_read_stream($opt['fileUpload'], $length);
+
+                if ($headers['Content-Type'] === 'application/x-www-form-urlencoded')
+                {
+                    $headers['Content-Type'] = 'application/octet-stream';
+                }
+            }
+            else
+            {
+                $request->set_read_file($opt['fileUpload']);
+
+                // Determine the length to read from the file
+                $length = $request->read_stream_size; // The file size by default
+
+                if (isset($headers['Content-Length']))
+                {
+                    $length = $headers['Content-Length'];
+                }
+                elseif (isset($opt['seekTo']) && isset($length))
+                {
+                    // Read from seekTo until EOF by default
+                    $length -= (integer) $opt['seekTo'];
+                }
+
+                $request->set_read_stream_size($length);
+
+                // Attempt to guess the correct mime-type
+                if ($headers['Content-Type'] === 'application/x-www-form-urlencoded')
+                {
+                    $extension = explode('.', $opt['fileUpload']);
+                    $extension = array_pop($extension);
+                    $mime_type = CFMimeTypes::get_mimetype($extension);
+                    $headers['Content-Type'] = $mime_type;
+                }
+            }
+
+            $headers['Content-Length'] = $request->read_stream_size;
+            $headers['Content-MD5'] = '';
+        }
+
+        // Handle streaming file offsets
+        if (isset($opt['seekTo']))
+        {
+            // Pass the seek position to RequestCore
+            $request->set_seek_position((integer) $opt['seekTo']);
+        }
+
+        // Streaming downloads
+        if (isset($opt['fileDownload']))
+        {
+            if (is_resource($opt['fileDownload']))
+            {
+                $request->set_write_stream($opt['fileDownload']);
+            }
+            else
+            {
+                $request->set_write_file($opt['fileDownload']);
+            }
+        }
+
+        $curlopts = array();
+
+        // Set custom CURLOPT settings
+        if (isset($opt['curlopts']))
+        {
+            $curlopts = $opt['curlopts'];
+        }
+
+        // Debug mode
+        if ($this->debug_mode)
+        {
+            $curlopts[CURLOPT_VERBOSE] = true;
+        }
+
+        // Set the curl options.
+        if (count($curlopts))
+        {
+            $request->set_curlopts($curlopts);
+        }
+
+        // Do we have a verb?
+        if (isset($opt['verb']))
+        {
+            $request->set_method($opt['verb']);
+            $string_to_sign .= $opt['verb'] . "\n";
+        }
+
+        // Add headers and content when we have a body
+        if (isset($opt['body']))
+        {
+            $request->set_body($opt['body']);
+            $headers['Content-Length'] = strlen($opt['body']);
+
+            if ($headers['Content-Type'] === 'application/x-www-form-urlencoded')
+            {
+                $headers['Content-Type'] = 'application/octet-stream';
+            }
+
+            if (!isset($opt['NoContentMD5']) || $opt['NoContentMD5'] !== true)
+            {
+                $headers['Content-MD5'] = $this->util->hex_to_base64(md5($opt['body']));
+            }
+        }
+
+        // Handle query-string authentication
+        if (isset($opt['preauth']) && (integer) $opt['preauth'] > 0)
+        {
+            unset($headers['Date']);
+            $headers['Content-Type'] = '';
+            $headers['Expires'] = is_int($opt['preauth']) ? $opt['preauth'] : strtotime($opt['preauth']);
+        }
+
+        // Sort headers
+        uksort($headers, 'strnatcasecmp');
+
+        // Add headers to request and compute the string to sign
+        foreach ($headers as $header_key => $header_value)
+        {
+            // Strip linebreaks from header values as they're illegal and can allow for security issues
+            $header_value = str_replace(array("\r", "\n"), '', $header_value);
+
+            // Add the header if it has a value
+            if ($header_value !== '')
+            {
+                $request->add_header($header_key, $header_value);
+            }
+
+            // Generate the string to sign
+            if (
+                strtolower($header_key) === 'content-md5' ||
+                strtolower($header_key) === 'content-type' ||
+                strtolower($header_key) === 'date' ||
+                (strtolower($header_key) === 'expires' && isset($opt['preauth']) && (integer) $opt['preauth'] > 0)
+            )
+            {
+                $string_to_sign .= $header_value . "\n";
+            }
+            elseif (substr(strtolower($header_key), 0, 6) === 'x-amz-')
+            {
+                $string_to_sign .= strtolower($header_key) . ':' . $header_value . "\n";
+            }
+        }
+
+
+        $access_key = $this->key;
+        $secret_key = $this->secret_key;
+        $method = isset($opt['verb']) ? $opt['verb'] : 'GET';
+        $region ='us-east-1';
+        $service = 's3';
+        $canonical_uri = "/".str_replace(' ', '%20', $resource);
+
+
+        $query = isset($opt['query_string']) ? $opt['query_string'] : array();
+        ksort($query);
+        $query_parts = array();
+        foreach($query as $k=>$v)
+        {
+            $query_parts[] = "$k=$v";
+        }
+        $canonical_querystring = join('&', $query_parts);
+
+
+        $t = time();
+        $amzdate = date('Ymd', $t).'T'.date('His', $t).'Z';
+        $datestamp = date('Ymd', $t);
+
+
+
+
+
+
+
+
+        $headers_to_sign = array('host'=>$hostname, 'x-amz-date'=>$amzdate);
+        foreach($headers as $k=>$v)
+        {
+            $headers_to_sign[strtolower($k)] = $v;
+        }
+        ksort($headers_to_sign);
+
+        $canonical_headers = "";
+        foreach($headers_to_sign as $k=>$v)
+        {
+            $canonical_headers .= "$k:$v\n";
+        }
+        $signed_headers = join(';', array_keys($headers_to_sign));
+
+        //$canonical_headers = 'host:' . $hostname . "\n" . 'x-amz-date:' . $amzdate . "\n";
+        //$signed_headers = 'host;x-amz-date';
+        $payload_hash = hash('sha256', isset($opt['body']) ? $opt['body'] : '');
+
+        $canonical_request = $method . "\n" . $canonical_uri . "\n" . $canonical_querystring . "\n" . $canonical_headers . "\n" . $signed_headers . "\n" . $payload_hash;
+
+
+        $canonical_request_hash = hash('sha256', $canonical_request);
+
+
+
+        $algorithm = 'AWS4-HMAC-SHA256';
+        $credential_scope = $datestamp . '/' . $region . '/' . $service . '/' . 'aws4_request';
+
+
+        $string_to_sign = $algorithm . "\n" .  $amzdate . "\n" . $credential_scope . "\n" .  $canonical_request_hash;
+
+
+
+
+
+
+        $signing_key = $this->getSignatureKey($secret_key, $datestamp, $region, $service);
+        $signature = hash_hmac('sha256', $string_to_sign, hex2bin($signing_key));
+        $authorization_header = $algorithm . ' ' . 'Credential=' . $access_key . '/' . $credential_scope . ', ' .  'SignedHeaders=' . $signed_headers.', ' . 'Signature=' . $signature;
+
+        $expected = file_get_contents('/Users/aworms/Desktop/aws-sign/aws-sig-v4-test-suite/aws-sig-v4-test-suite/get-vanilla-query-order-key-case/get-vanilla-query-order-key-case.sreq');
+
+
+
+
+
+
+        // Add the signable resource location
+        #$string_to_sign .= ($this->resource_prefix ? $this->resource_prefix : '');
+        #$string_to_sign .= (($bucket === '' || $this->resource_prefix === '/' . $bucket) ? '' : ('/' . $bucket)) . $signable_resource . urldecode($signable_query_string);
+
+        // Hash the AWS secret key and generate a signature for the request.
+        //$signature = base64_encode(hash_hmac('sha1', $string_to_sign, $this->secret_key, true));
+        #$request->add_header('Authorization', 'AWS ' . $this->key . ':' . $signature);
+
+        $request->add_header('X-Amz-Date', $amzdate);
+        $request->add_header('x-amz-content-sha256', $payload_hash);
+        $request->add_header('Authorization', $authorization_header);
+
+
+
+
+        // If we're generating a URL, return the URL to the calling method.
+        if (isset($opt['preauth']) && (integer) $opt['preauth'] > 0)
+        {
+            $query_params = array(
+                'AWSAccessKeyId' => $this->key,
+                'Expires' => $headers['Expires'],
+                'Signature' => $signature,
+            );
+
+            // If using short-term credentials, add the token to the query string
+            if ($this->auth_token)
+            {
+                $query_params['x-amz-security-token'] = $this->auth_token;
+            }
+
+            return $this->request_url . $conjunction . http_build_query($query_params, '', '&');
+        }
+        elseif (isset($opt['preauth']))
+        {
+            return $this->request_url;
+        }
+
+        /*%******************************************************************************************%*/
+
+        // If our changes were temporary, reset them.
+        if ($this->temporary_prefix)
+        {
+            $this->temporary_prefix = false;
+            $this->resource_prefix = null;
+        }
+
+        // Manage the (newer) batch request API or the (older) returnCurlHandle setting.
+        if ($this->use_batch_flow)
+        {
+            $handle = $request->prep_request();
+            $this->batch_object->add($handle);
+            $this->use_batch_flow = false;
+
+            return $handle;
+        }
+        elseif (isset($opt['returnCurlHandle']) && $opt['returnCurlHandle'] === true)
+        {
+            return $request->prep_request();
+        }
+
+        // Send!
+        $request->send_request();
+
+        $b = $request->response_body;
+
+
+        // Prepare the response
+        $headers = $request->get_response_header();
+        $headers['x-aws-request-url'] = $this->request_url;
+        $headers['x-aws-redirects'] = $this->redirects;
+        $headers['x-aws-stringtosign'] = $string_to_sign;
+        $headers['x-aws-requestheaders'] = $request->request_headers;
+
+        // Did we have a request body?
+        if (isset($opt['body']))
+        {
+            $headers['x-aws-requestbody'] = $opt['body'];
+        }
+
+        $data = new $this->response_class($headers, $this->parse_callback($request->get_response_body()), $request->get_response_code());
+
+        // Did Amazon tell us to redirect? Typically happens for multiple rapid requests EU datacenters.
+        // @see: http://docs.amazonwebservices.com/AmazonS3/latest/dev/Redirects.html
+        // @codeCoverageIgnoreStart
+        if ((integer) $request->get_response_code() === 307) // Temporary redirect to new endpoint.
+        {
+            $this->redirects++;
+            $opt['location'] = $headers['location'];
+            $data = $this->authenticate($bucket, $opt);
+        }
+
+        // Was it Amazon's fault the request failed? Retry the request until we reach $max_retries.
+        elseif ((integer) $request->get_response_code() === 500 || (integer) $request->get_response_code() === 503)
+        {
+            if ($this->redirects <= $this->max_retries)
+            {
+                // Exponential backoff
+                $delay = (integer) (pow(4, $this->redirects) * 100000);
+                usleep($delay);
+                $this->redirects++;
+                $data = $this->authenticate($bucket, $opt);
+            }
+        }
+        // @codeCoverageIgnoreEnd
+
+        // Return!
+        $this->redirects = 0;
+        return $data;
+    }
 
 	/**
 	 * Validates whether or not the specified Amazon S3 bucket name is valid for DNS-style access. This
